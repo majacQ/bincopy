@@ -1,11 +1,9 @@
-|buildstatus|_
-|coverage|_
-
 About
 =====
 
 Mangling of various file formats that conveys binary information
-(Motorola S-Record, Intel HEX, TI-TXT and binary files).
+(Motorola S-Record, Intel HEX, TI-TXT, Verilog VMEM, ELF and binary
+files).
 
 Project homepage: https://github.com/eerimoq/bincopy
 
@@ -48,6 +46,10 @@ array and hexdump formats:
     19 4E 79 23 46 23 96 57 78 23 9E DA 3F 01 B2 CA
     3F 01 56 70 2B 5E 71 2B 72 2B 73 21 46 01 34 21
     q
+
+    >>> print(f.as_verilog_vmem())
+    @00000100 21 46 01 36 01 21 47 01 36 00 7E FE 09 D2 19 01 21 46 01 7E 17 C2 00 01 FF 5F 16 00 21 48 01 19
+    @00000120 19 4E 79 23 46 23 96 57 78 23 9E DA 3F 01 B2 CA 3F 01 56 70 2B 5E 71 2B 72 2B 73 21 46 01 34 21
 
     >>> f.as_binary()
     bytearray(b'!F\x016\x01!G\x016\x00~\xfe\t\xd2\x19\x01!F\x01~\x17\xc2\x00\x01
@@ -191,12 +193,6 @@ These projects provides features similar to bincopy:
 - `IntelHex`_ (Python IntelHex library)
 
 - `objutils`_ (Process HEX files in Python)
-
-.. |buildstatus| image:: https://travis-ci.com/eerimoq/bincopy.svg
-.. _buildstatus: https://travis-ci.com/eerimoq/bincopy
-
-.. |coverage| image:: https://coveralls.io/repos/github/eerimoq/bincopy/badge.svg?branch=master
-.. _coverage: https://coveralls.io/github/eerimoq/bincopy
 
 .. _test suite: https://github.com/eerimoq/bincopy/blob/master/tests/test_bincopy.py
 
