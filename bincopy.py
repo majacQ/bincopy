@@ -3,6 +3,7 @@
 
 """
 
+import re
 import copy
 import binascii
 import string
@@ -10,13 +11,16 @@ import sys
 import argparse
 from collections import namedtuple
 from io import StringIO
+from io import BytesIO
 
 from humanfriendly import format_size
 from argparse_addons import Integer
+from elftools.elf.elffile import ELFFile
+from elftools.elf.constants import SH_FLAGS
 
 
 __author__ = 'Erik Moqvist'
-__version__ = '17.9.0'
+__version__ = '20.1.0'
 
 
 DEFAULT_WORD_SIZE_BITS = 8
@@ -290,6 +294,22 @@ def pretty_ti_txt(line):
     return line
 
 
+def comment_remover(text):
+    def replacer(match):
+        s = match.group(0)
+
+        if s.startswith('/'):
+            return " " # note: a space and not an empty string
+        else:
+            return s
+
+    pattern = re.compile(
+        r'//.*?$|/\*.*?\*/|\'(?:\\.|[^\\\'])*\'|"(?:\\.|[^\\"])*"',
+        re.DOTALL | re.MULTILINE)
+
+    return re.sub(pattern, replacer, text)
+
+
 def is_srec(records):
     try:
         unpack_srec(records.partition('\n')[0].rstrip())
@@ -310,59 +330,88 @@ def is_ihex(records):
 
 def is_ti_txt(data):
     try:
-        return data[0] in ['@', 'q']
-    except IndexError:
+        BinFile().add_ti_txt(data)
+    except Exception:
         return False
+    else:
+        return True
 
 
-class _Segment:
+def is_verilog_vmem(data):
+    try:
+        BinFile().add_verilog_vmem(data)
+    except Exception:
+        return False
+    else:
+        return True
+
+
+class Segment:
     """A segment is a chunk data with given minimum and maximum address.
 
     """
-
-    _Chunk = namedtuple('Chunk', ['address', 'data'])
 
     def __init__(self, minimum_address, maximum_address, data, word_size_bytes):
         self.minimum_address = minimum_address
         self.maximum_address = maximum_address
         self.data = data
-        self._word_size_bytes = word_size_bytes
+        self.word_size_bytes = word_size_bytes
 
     @property
     def address(self):
-        return self.minimum_address // self._word_size_bytes
+        return self.minimum_address // self.word_size_bytes
 
-    def chunks(self, size=32, alignment=1):
-        """Return chunks of the data aligned as given by `alignment`. `size`
-        must be a multiple of `alignment`. Each chunk is returned as a
-        named two-tuple of its address and data. Both `size` and
-        `alignment` are in words.
+    def chunks(self, size=32, alignment=1, padding=b''):
+        """Yield data chunks of `size` words, aligned as given by `alignment`.
+
+        Each chunk is itself a Segment.
+
+        `size` and `alignment` are in words. `size` must be a multiple of
+        `alignment`. If set, `padding` must be a word value.
+
+        If `padding` is set, the first and final chunks are padded so that:
+            1. The first chunk is aligned even if the segment itself is not.
+            2. The final chunk's size is a multiple of `alignment`.
 
         """
 
         if (size % alignment) != 0:
             raise Error(f'size {size} is not a multiple of alignment {alignment}')
 
-        size *= self._word_size_bytes
-        alignment *= self._word_size_bytes
+        if padding and len(padding) != self.word_size_bytes:
+            raise Error(f'padding must be a word value (size {self.word_size_bytes}),'
+                        f' got {padding}')
+
+        size *= self.word_size_bytes
+        alignment *= self.word_size_bytes
         address = self.minimum_address
         data = self.data
 
-        # First chunk may be shorter than `size` due to alignment.
+        # Apply padding to first and final chunk, if padding is non-empty.
+        align_offset = address % alignment
+        address -= align_offset * bool(padding)
+        data = align_offset // self.word_size_bytes * padding + data
+        data += (alignment - len(data)) % alignment // self.word_size_bytes * padding
+
+        # First chunk may be non-aligned and shorter than `size` if padding is empty.
         chunk_offset = (address % alignment)
 
         if chunk_offset != 0:
             first_chunk_size = (alignment - chunk_offset)
-            yield self._Chunk(address // self._word_size_bytes,
-                              data[:first_chunk_size])
-            address += (first_chunk_size // self._word_size_bytes)
+            yield Segment(address,
+                          address + size,
+                          data[:first_chunk_size],
+                          self.word_size_bytes)
+            address += first_chunk_size
             data = data[first_chunk_size:]
         else:
             first_chunk_size = 0
 
         for offset in range(0, len(data), size):
-            yield self._Chunk((address + offset) // self._word_size_bytes,
-                              data[offset:offset + size])
+            yield Segment(address + offset,
+                          address + offset + size,
+                          data[offset:offset + size],
+                          self.word_size_bytes)
 
     def add_data(self, minimum_address, maximum_address, data, overwrite):
         """Add given data to this segment. The added data must be adjacent to
@@ -414,8 +463,8 @@ class _Segment:
         """
 
         if ((minimum_address >= self.maximum_address)
-            and (maximum_address <= self.minimum_address)):
-            raise Error('cannot remove data that is not part of the segment')
+            or (maximum_address <= self.minimum_address)):
+            return
 
         if minimum_address < self.minimum_address:
             minimum_address = self.minimum_address
@@ -433,10 +482,10 @@ class _Segment:
             self.maximum_address = self.minimum_address + part1_size
             self.data = part1_data
 
-            return _Segment(maximum_address,
-                            maximum_address + len(part2_data),
-                            part2_data,
-                            self._word_size_bytes)
+            return Segment(maximum_address,
+                           maximum_address + len(part2_data),
+                           part2_data,
+                           self.word_size_bytes)
         else:
             # Update this segment.
             if len(part1_data) > 0:
@@ -452,11 +501,11 @@ class _Segment:
     def __eq__(self, other):
         if isinstance(other, tuple):
             return self.address, self.data == other
-        elif isinstance(other, _Segment):
+        elif isinstance(other, Segment):
             return ((self.minimum_address == other.minimum_address)
                     and (self.maximum_address == other.maximum_address)
                     and (self.data == other.data)
-                    and (self._word_size_bytes == other._word_size_bytes))
+                    and (self.word_size_bytes == other.word_size_bytes))
         else:
             return False
 
@@ -468,14 +517,20 @@ class _Segment:
     def __repr__(self):
         return f'Segment(address={self.address}, data={self.data})'
 
+    def __len__(self):
+        return len(self.data) // self.word_size_bytes
 
-class _Segments:
+
+_Segment = Segment
+
+
+class Segments:
     """A list of segments.
 
     """
 
     def __init__(self, word_size_bytes):
-        self._word_size_bytes = word_size_bytes
+        self.word_size_bytes = word_size_bytes
         self._current_segment = None
         self._current_segment_index = None
         self._list = []
@@ -584,37 +639,60 @@ class _Segments:
         new_list = []
 
         for segment in self._list:
-            if (segment.maximum_address <= minimum_address
-                or maximum_address < segment.minimum_address):
-                # No overlap.
+            split = segment.remove_data(minimum_address, maximum_address)
+
+            if segment.minimum_address < segment.maximum_address:
                 new_list.append(segment)
-            else:
-                # Overlapping, remove overwritten parts segments.
-                split = segment.remove_data(minimum_address, maximum_address)
 
-                if segment.minimum_address < segment.maximum_address:
-                    new_list.append(segment)
-
-                if split:
-                    new_list.append(split)
+            if split:
+                new_list.append(split)
 
         self._list = new_list
 
-    def chunks(self, size=32, alignment=1):
-        """Iterate over all segments and return chunks of the data aligned as
-        given by `alignment`. `size` must be a multiple of
-        `alignment`. Each chunk is returned as a named two-tuple of
-        its address and data. Both `size` and `alignment` are in
-        words.
+    def chunks(self, size=32, alignment=1, padding=b''):
+        """Iterate over all segments and yield chunks of the data.
+        
+        The chunks are `size` words long, aligned as given by `alignment`.
+
+        Each chunk is itself a Segment.
+
+        `size` and `alignment` are in words. `size` must be a multiple of
+        `alignment`. If set, `padding` must be a word value.
+
+        If `padding` is set, the first and final chunks of each segment are
+        padded so that:
+            1. The first chunk is aligned even if the segment itself is not.
+            2. The final chunk's size is a multiple of `alignment`.
 
         """
 
         if (size % alignment) != 0:
             raise Error(f'size {size} is not a multiple of alignment {alignment}')
 
+        if padding and len(padding) != self.word_size_bytes:
+            raise Error(f'padding must be a word value (size {self.word_size_bytes}),'
+                        f' got {padding}')
+
+        previous = Segment(-1, -1, b'', 1)
+
         for segment in self:
-            for chunk in segment.chunks(size, alignment):
+            for chunk in segment.chunks(size, alignment, padding):
+                # When chunks are padded to alignment, the final chunk of the previous
+                # segment and the first chunk of the current segment may overlap by
+                # one alignment block. To avoid overwriting data from the lower
+                # segment, the chunks must be merged.
+                if chunk.address < previous.address + len(previous):
+                    low = previous.data[-alignment * self.word_size_bytes:]
+                    high = chunk.data[:alignment * self.word_size_bytes]
+                    merged = int.to_bytes(int.from_bytes(low, 'big') ^
+                                          int.from_bytes(high, 'big') ^
+                                          int.from_bytes(alignment * padding, 'big'),
+                                          alignment * self.word_size_bytes, 'big')
+                    chunk.data = merged + chunk.data[alignment * self.word_size_bytes:]
+
                 yield chunk
+
+            previous = chunk
 
     def __len__(self):
         """Get the number of segments.
@@ -623,6 +701,9 @@ class _Segments:
 
         return len(self._list)
 
+
+_Segments = Segments
+    
 
 class BinFile:
     """A binary file.
@@ -657,7 +738,7 @@ class BinFile:
         self._header_encoding = header_encoding
         self._header = None
         self._execution_start_address = None
-        self._segments = _Segments(self.word_size_bytes)
+        self._segments = Segments(self.word_size_bytes)
 
         if filenames is not None:
             if isinstance(filenames, str):
@@ -807,10 +888,10 @@ class BinFile:
         >>> for chunk in binfile.segments.chunks(2):
         ...     print(chunk)
         ...
-        Chunk(address=0, data=bytearray(b'\\x00\\x01'))
-        Chunk(address=2, data=bytearray(b'\\x02'))
-        Chunk(address=10, data=bytearray(b'\\x03\\x04'))
-        Chunk(address=12, data=bytearray(b'\\x05'))
+        Segment(address=0, data=bytearray(b'\\x00\\x01'))
+        Segment(address=2, data=bytearray(b'\\x02'))
+        Segment(address=10, data=bytearray(b'\\x03\\x04'))
+        Segment(address=12, data=bytearray(b'\\x05'))
 
         Each segment can be split into smaller pieces using the
         `chunks(size=32, alignment=1)` method on a single segment.
@@ -821,11 +902,11 @@ class BinFile:
         ...         print(chunk)
         ...
         Segment(address=0, data=bytearray(b'\\x00\\x01\\x02'))
-        Chunk(address=0, data=bytearray(b'\\x00\\x01'))
-        Chunk(address=2, data=bytearray(b'\\x02'))
+        Segment(address=0, data=bytearray(b'\\x00\\x01'))
+        Segment(address=2, data=bytearray(b'\\x02'))
         Segment(address=10, data=bytearray(b'\\x03\\x04\\x05'))
-        Chunk(address=10, data=bytearray(b'\\x03\\x04'))
-        Chunk(address=12, data=bytearray(b'\\x05'))
+        Segment(address=10, data=bytearray(b'\\x03\\x04'))
+        Segment(address=12, data=bytearray(b'\\x05'))
 
         """
 
@@ -844,6 +925,8 @@ class BinFile:
             self.add_ihex(data, overwrite)
         elif is_ti_txt(data):
             self.add_ti_txt(data, overwrite)
+        elif is_verilog_vmem(data):
+            self.add_verilog_vmem(data, overwrite)
         else:
             raise UnsupportedFileFormatError()
 
@@ -866,10 +949,10 @@ class BinFile:
                 self._header = data
             elif type_ in '123':
                 address *= self.word_size_bytes
-                self._segments.add(_Segment(address,
-                                            address + size,
-                                            data,
-                                            self.word_size_bytes),
+                self._segments.add(Segment(address,
+                                           address + size,
+                                           data,
+                                           self.word_size_bytes),
                                    overwrite)
             elif type_ in '789':
                 self.execution_start_address = address
@@ -897,10 +980,10 @@ class BinFile:
                            + extended_segment_address
                            + extended_linear_address)
                 address *= self.word_size_bytes
-                self._segments.add(_Segment(address,
-                                            address + size,
-                                            data,
-                                            self.word_size_bytes),
+                self._segments.add(Segment(address,
+                                           address + size,
+                                           data,
+                                           self.word_size_bytes),
                                    overwrite)
             elif type_ == IHEX_END_OF_FILE:
                 pass
@@ -960,10 +1043,10 @@ class BinFile:
                 if address is None:
                     raise Error("missing section address")
 
-                self._segments.add(_Segment(address,
-                                            address + size,
-                                            data,
-                                            self.word_size_bytes),
+                self._segments.add(Segment(address,
+                                           address + size,
+                                           data,
+                                           self.word_size_bytes),
                                    overwrite)
 
                 if size == TI_TXT_BYTES_PER_LINE:
@@ -974,6 +1057,46 @@ class BinFile:
         if not eof_found:
             raise Error("missing file terminator")
 
+    def add_verilog_vmem(self, data, overwrite=False):
+        address = None
+        chunk = b''
+        words = re.split(r'\s+', comment_remover(data).strip())
+        word_size_bytes = None
+
+        for word in words:
+            if not word.startswith('@'):
+                length = len(word)
+
+                if (length % 2) != 0:
+                    raise Error('Invalid word length.')
+
+                length //= 2
+
+                if word_size_bytes is None:
+                    word_size_bytes = length
+                elif length != word_size_bytes:
+                    raise Error(
+                        f'Mixed word lengths {length} and {word_size_bytes}.')
+
+        for word in words:
+            if word.startswith('@'):
+                if address is not None:
+                    self._segments.add(Segment(address,
+                                               address + len(chunk),
+                                               chunk,
+                                               self.word_size_bytes))
+
+                address = int(word[1:], 16) * word_size_bytes
+                chunk = b''
+            else:
+                chunk += bytes.fromhex(word)
+
+        if address is not None and chunk:
+            self._segments.add(Segment(address,
+                                       address + len(chunk),
+                                       chunk,
+                                       self.word_size_bytes))
+
     def add_binary(self, data, address=0, overwrite=False):
         """Add given data at given address. Set `overwrite` to ``True`` to
         allow already added data to be overwritten.
@@ -981,21 +1104,94 @@ class BinFile:
         """
 
         address *= self.word_size_bytes
-        self._segments.add(_Segment(address,
-                                    address + len(data),
-                                    bytearray(data),
-                                    self.word_size_bytes),
+        self._segments.add(Segment(address,
+                                   address + len(data),
+                                   bytearray(data),
+                                   self.word_size_bytes),
                            overwrite)
+
+    def add_elf(self, data, overwrite=True):
+        """Add given ELF data.
+
+        """
+
+        elffile = ELFFile(BytesIO(data))
+
+        self.execution_start_address = elffile.header['e_entry']
+
+        for segment in elffile.iter_segments():
+            if segment['p_type'] != 'PT_LOAD':
+                 continue
+
+            segment_address = segment['p_paddr']
+            segment_offset = segment['p_offset']
+            segment_size = segment['p_filesz']
+
+            for section in elffile.iter_sections():
+                offset = section['sh_offset']
+                size = section['sh_size']
+                address = segment_address + offset - segment_offset
+
+                if size == 0:
+                    continue
+
+                if segment_offset <= offset < segment_offset + segment_size:
+                    if section['sh_type'] == 'SHT_NOBITS':
+                        continue
+
+                    if (section['sh_flags'] & SH_FLAGS.SHF_ALLOC) == 0:
+                        continue
+
+                    self._segments.add(Segment(address,
+                                               address + size,
+                                               data[offset:offset + size],
+                                               self.word_size_bytes),
+                                       overwrite)
+
+    def add_microchip_hex(self, records, overwrite=False):
+        """Add given Microchip HEX data.
+
+        Microchip's HEX format is identical to Intel's except an address in
+        the HEX file is twice the actual machine address. For example:
+
+        :02000E00E4C943
+
+            :       Start code
+            02      Record contains two data bytes
+            000E    Address 0x000E; Machine address is 0x000E // 2 == 0x0007
+            00      Record type is data
+            E4      Low byte at address 0x0007 is 0xE4
+            C9      High byte at address 0x0007 is 0xC9
+
+        Microchip HEX records therefore need to be parsed as if the word size
+        is one byte, but the parsed data must be handled as if the word size
+        is two bytes. This is true for both 8-bit PICs such as PIC18 and
+        16-bit PICs such as PIC24.
+
+        """
+
+        self.word_size_bytes = 1
+        self.add_ihex(records, overwrite)
+        self.word_size_bytes = 2
+        self.segments.word_size_bytes = 2
+
+        for segment in self.segments:
+            segment.word_size_bytes = 2
 
     def add_file(self, filename, overwrite=False):
         """Open given file and add its data by guessing its format. The format
-        must be Motorola S-Records, Intel HEX or TI-TXT. Set `overwrite` to
-        ``True`` to allow already added data to be overwritten.
+        must be Motorola S-Records, Intel HEX, TI-TXT. Set `overwrite`
+        to ``True`` to allow already added data to be overwritten.
 
         """
 
         with open(filename, 'r') as fin:
-            self.add(fin.read(), overwrite)
+            try:
+                data = fin.read()
+            except UnicodeDecodeError:
+                raise UnsupportedFileFormatError()
+
+        self.add(data, overwrite)
 
     def add_srec_file(self, filename, overwrite=False):
         """Open given Motorola S-Records file and add its records. Set
@@ -1025,6 +1221,15 @@ class BinFile:
         with open(filename, 'r') as fin:
             self.add_ti_txt(fin.read(), overwrite)
 
+    def add_verilog_vmem_file(self, filename, overwrite=False):
+        """Open given Verilog VMEM file and add its contents. Set `overwrite` to
+        ``True`` to allow already added data to be overwritten.
+
+        """
+
+        with open(filename, 'r') as fin:
+            self.add_verilog_vmem(fin.read(), overwrite)
+
     def add_binary_file(self, filename, address=0, overwrite=False):
         """Open given binary file and add its contents. Set `overwrite` to
         ``True`` to allow already added data to be overwritten.
@@ -1033,6 +1238,24 @@ class BinFile:
 
         with open(filename, 'rb') as fin:
             self.add_binary(fin.read(), address, overwrite)
+
+    def add_elf_file(self, filename, overwrite=False):
+        """Open given ELF file and add its contents. Set `overwrite` to
+        ``True`` to allow already added data to be overwritten.
+
+        """
+
+        with open(filename, 'rb') as fin:
+            self.add_elf(fin.read(), overwrite)
+
+    def add_microchip_hex_file(self, filename, overwrite=False):
+        """Open given Microchip HEX file and add its contents. Set `overwrite`
+        to ``True`` to allow already added data to be overwritten.
+
+        """
+
+        with open(filename, 'r') as fin:
+            self.add_microchip_hex(fin.read(), overwrite)
 
     def as_srec(self, number_of_data_bytes=32, address_length_bits=32):
         """Format the binary file as Motorola S-Records records and return
@@ -1203,6 +1426,39 @@ class BinFile:
 
         return '\n'.join(data_address + footer) + '\n'
 
+    def as_microchip_hex(self, number_of_data_bytes=32, address_length_bits=32):
+        """Format the binary file as Microchip HEX records and return them as a
+        string.
+
+        `number_of_data_bytes` is the number of data bytes in each
+        record.
+
+        `address_length_bits` is the number of address bits in each
+        record.
+
+        >>> print(binfile.as_microchip_hex())
+        :20010000214601360121470136007EFE09D219012146017E17C20001FF5F16002148011979
+        :20012000194E79234623965778239EDA3F01B2CA3F0156702B5E712B722B7321460134219F
+        :00000001FF
+
+        """
+
+        self.word_size_bytes = 1
+        self.segments.word_size_bytes = 1
+
+        for segment in self.segments:
+            segment.word_size_bytes = 1
+
+        records = self.as_ihex(number_of_data_bytes, address_length_bits)
+
+        self.word_size_bytes = 2
+        self.segments.word_size_bytes = 2
+
+        for segment in self.segments:
+            segment.word_size_bytes = 2
+
+        return records
+
     def as_ti_txt(self):
         """Format the binary file as a TI-TXT file and return it as a string.
 
@@ -1226,6 +1482,35 @@ class BinFile:
                 lines.append(' '.join(f'{byte:02X}' for byte in data))
 
         lines.append('q')
+
+        return '\n'.join(lines) + '\n'
+
+    def as_verilog_vmem(self):
+        """Format the binary file as a Verilog VMEM file and return it as a string.
+
+        >>> print(binfile.as_verilog_vmem())
+
+        """
+
+        lines = []
+
+        if self._header is not None:
+            lines.append(f'/* {self.header} */')
+
+        for segment in self._segments:
+            for address, data in segment.chunks(32 // self.word_size_bytes):
+                words = []
+
+                for i in range(0, len(data), self.word_size_bytes):
+                    word = ''
+
+                    for byte in data[i:i + self.word_size_bytes]:
+                        word += f'{byte:02X}'
+
+                    words.append(word)
+
+                data_hex = ' '.join(words)
+                lines.append(f'@{address:08X} {data_hex}')
 
         return '\n'.join(lines) + '\n'
 
@@ -1453,7 +1738,7 @@ class BinFile:
                 fill_size_words = fill_size // self.word_size_bytes
 
                 if max_words is None or fill_size_words <= max_words:
-                    fill_segments.append(_Segment(
+                    fill_segments.append(Segment(
                         previous_segment_maximum_address,
                         previous_segment_maximum_address + fill_size,
                         value * fill_size_words,
@@ -1617,7 +1902,7 @@ def _convert_input_format_type(value):
                     f"invalid binary address '{items[1]}'")
 
         args = (address, )
-    elif fmt in ['ihex', 'srec', 'auto', 'ti_txt']:
+    elif fmt in ['ihex', 'srec', 'auto', 'ti_txt', 'verilog_vmem', 'elf']:
         pass
     else:
         raise argparse.ArgumentTypeError(f"invalid input format '{fmt}'")
@@ -1649,6 +1934,8 @@ def _convert_output_format_type(value):
                     f"invalid {fmt} address length of '{items[2]}' bits")
 
         args = (number_of_data_bytes, address_length_bits)
+    elif fmt == 'elf':
+        raise argparse.ArgumentTypeError(f"invalid output format '{fmt}'")
     elif fmt == 'binary':
         minimum_address = None
         maximum_address = None
@@ -1670,6 +1957,8 @@ def _convert_output_format_type(value):
         args = (minimum_address, maximum_address)
     elif fmt == 'hexdump':
         pass
+    elif fmt == 'verilog_vmem':
+        pass
     else:
         raise argparse.ArgumentTypeError(f"invalid output format '{fmt}'")
 
@@ -1684,7 +1973,10 @@ def _do_convert_add_file(bf, input_format, infile, overwrite):
             try:
                 bf.add_file(infile, *args, overwrite=overwrite)
             except UnsupportedFileFormatError:
-                bf.add_binary_file(infile, *args, overwrite=overwrite)
+                try:
+                    bf.add_elf_file(infile, *args, overwrite=overwrite)
+                except:
+                    bf.add_binary_file(infile, *args, overwrite=overwrite)
         elif fmt == 'srec':
             bf.add_srec_file(infile, *args, overwrite=overwrite)
         elif fmt == 'ihex':
@@ -1693,6 +1985,10 @@ def _do_convert_add_file(bf, input_format, infile, overwrite):
             bf.add_binary_file(infile, *args, overwrite=overwrite)
         elif fmt == 'ti_txt':
             bf.add_ti_txt_file(infile, *args, overwrite=overwrite)
+        elif fmt == 'verilog_vmem':
+            bf.add_verilog_vmem_file(infile, *args, overwrite=overwrite)
+        elif fmt == 'elf':
+            bf.add_elf_file(infile, *args, overwrite=overwrite)
     except AddDataError:
         sys.exit('overlapping segments detected, give --overwrite to overwrite '
                  'overlapping segments')
@@ -1711,6 +2007,8 @@ def _do_convert_as(bf, output_format):
         converted = bf.as_hexdump()
     elif fmt == 'ti_txt':
         converted = bf.as_ti_txt()
+    elif fmt == 'verilog_vmem':
+        converted = bf.as_verilog_vmem()
 
     return converted
 
@@ -1780,11 +2078,19 @@ def _do_as_hexdump(args):
         bf.add_file(binfile)
         print(bf.as_hexdump(), end='')
 
+
 def _do_as_ti_txt(args):
     for binfile in args.binfile:
         bf = BinFile()
         bf.add_file(binfile)
         print(bf.as_ti_txt(), end='')
+
+
+def _do_as_verilog_vmem(args):
+    for binfile in args.binfile:
+        bf = BinFile()
+        bf.add_file(binfile)
+        print(bf.as_verilog_vmem(), end='')
 
 
 def _do_fill(args):
@@ -1857,14 +2163,14 @@ def _main():
         action='append',
         default=[],
         type=_convert_input_format_type,
-        help=('Input format auto, srec, ihex, ti_txt, or binary[,<address>] '
-              '(default: auto). This argument may be repeated, selecting the '
-              'input format for each input file.'))
+        help=('Input format auto, srec, ihex, ti_txt, verilog_vmem, elf, or '
+              'binary[,<address>] (default: auto). This argument may be repeated, '
+              'selecting the input format for each input file.'))
     subparser.add_argument(
         '-o', '--output-format',
         default='hexdump',
         type=_convert_output_format_type,
-        help=('Output format srec, ihex, ti_txt, binary or hexdump '
+        help=('Output format srec, ihex, ti_txt, verilog_vmem, binary or hexdump '
               '(default: %(default)s).'))
     subparser.add_argument(
         '-s', '--word-size-bits',
@@ -1926,6 +2232,15 @@ def _main():
                            nargs='+',
                            help='One or more binary format files.')
     subparser.set_defaults(func=_do_as_ti_txt)
+
+    # The 'as_verilog_vmem' subparser.
+    subparser = subparsers.add_parser(
+        'as_verilog_vmem',
+        description='Print given file(s) as Verilog VMEM.')
+    subparser.add_argument('binfile',
+                           nargs='+',
+                           help='One or more binary format files.')
+    subparser.set_defaults(func=_do_as_verilog_vmem)
 
     # The 'fill' subparser.
     subparser = subparsers.add_parser(

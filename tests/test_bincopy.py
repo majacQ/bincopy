@@ -532,7 +532,7 @@ class BinCopyTest(unittest.TestCase):
                          "record 'invalid data' not starting with a ':'")
 
         with self.assertRaises(bincopy.UnsupportedFileFormatError) as cm:
-            binfile.add('')
+            binfile.add('junk')
 
     def test_add_file(self):
         binfile = bincopy.BinFile()
@@ -703,6 +703,7 @@ class BinCopyTest(unittest.TestCase):
                          b'222222' +
                          2 * b'\xff' +
                          b'333333')
+        self.assertEqual(len(binfile.segments), 3)
 
         binfile.exclude(20, 24)
         self.assertEqual(binfile.as_binary(),
@@ -711,24 +712,35 @@ class BinCopyTest(unittest.TestCase):
                          b'2222' +
                          4 * b'\xff' +
                          b'333333')
+        self.assertEqual(len(binfile.segments), 3)
 
         binfile.exclude(12, 24)
         self.assertEqual(binfile.as_binary(),
                          b'1111' +
                          12 * b'\xff' +
                          b'333333')
+        self.assertEqual(len(binfile.segments), 2)
 
         binfile.exclude(11, 25)
         self.assertEqual(binfile.as_binary(),
                          b'111' +
                          14 * b'\xff' +
                          b'33333')
+        self.assertEqual(len(binfile.segments), 2)
 
         binfile.exclude(11, 26)
         self.assertEqual(binfile.as_binary(),
                          b'111' +
                          15 * b'\xff' +
                          b'3333')
+        self.assertEqual(len(binfile.segments), 2)
+
+        binfile.exclude(27, 29)
+        self.assertEqual(binfile.as_binary(),
+                         b'111' +
+                         15 * b'\xff' +
+                         b'3' + 2 * b'\xff' + b'3')
+        self.assertEqual(len(binfile.segments), 3)
 
         # Exclude negative address range and expty address range.
         binfile = bincopy.BinFile()
@@ -897,6 +909,12 @@ class BinCopyTest(unittest.TestCase):
 
         self.assertEqual(str(cm.exception),
                          'size 4 is not a multiple of alignment 8')
+
+        with self.assertRaises(bincopy.Error) as cm:
+            list(binfile.segments.chunks(padding=b'\xff\xff'))
+
+        self.assertEqual(str(cm.exception),
+                         r"padding must be a word value (size 1), got b'\xff\xff'")
 
     def test_segment(self):
         binfile = bincopy.BinFile()
@@ -1368,6 +1386,23 @@ Data ranges:
                 print("Failed converting {} as {}".format(test_file, input_format))
                 raise exc
 
+    def test_command_line_convert_elf(self):
+        with open('tests/files/elf.hexdump') as fin:
+            expected_output = fin.read()
+
+        datas = [
+            ('elf', 'tests/files/elf.out'),
+            ('auto', 'tests/files/elf.out')
+        ]
+
+        for input_format, test_file in datas:
+            try:
+                command = ['bincopy', 'convert', '-i', input_format, test_file, '-']
+                self._test_command_line_ok(command, expected_output)
+            except SystemExit as exc:
+                print("Failed converting {} as {}".format(test_file, input_format))
+                raise exc
+
     def test_command_line_convert_output_formats(self):
         test_file = 'tests/files/convert.hex'
         binfile = bincopy.BinFile(test_file)
@@ -1735,6 +1770,159 @@ Data ranges:
 
         with open('tests/files/in.s19', 'r') as fin:
             self.assertEqual(binfile.as_srec(28, 16), fin.read())
+
+    def test_add_elf(self):
+        bf = bincopy.BinFile()
+        bf.add_elf_file('tests/files/elf.out')
+
+        with open('tests/files/elf.s19', 'r') as fin:
+            self.assertEqual(bf.as_srec(), fin.read())
+
+    def test_add_elf_blinky(self):
+        bf = bincopy.BinFile()
+        bf.add_elf_file('tests/files/evkbimxrt1050_iled_blinky_sdram.axf')
+        actual_srec = bf.as_srec()
+
+        bf = bincopy.BinFile()
+        bf.add_srec_file('tests/files/evkbimxrt1050_iled_blinky_sdram.s19')
+        expected_srec = bf.as_srec()
+
+        self.assertEqual(actual_srec, expected_srec)
+
+    def test_add_elf_gcc(self):
+        bf = bincopy.BinFile()
+        bf.add_elf_file('tests/files/elf/gcc.elf')
+
+        with open('tests/files/elf/gcc.bin', 'rb') as fin:
+            self.assertEqual(bf.as_binary(), fin.read())
+
+    def test_add_elf_iar(self):
+        bf = bincopy.BinFile()
+        bf.add_elf_file('tests/files/elf/iar.out')
+
+        with open('tests/files/elf/iar.bin', 'rb') as fin:
+            self.assertEqual(bf.as_binary(), fin.read())
+
+    def test_add_elf_keil(self):
+        bf = bincopy.BinFile()
+        bf.add_elf_file('tests/files/elf/keil.out')
+
+        with open('tests/files/elf/keil.bin', 'rb') as fin:
+            self.assertEqual(bf.as_binary(), fin.read())
+
+    def test_exclude_edge_cases(self):
+        binfile = bincopy.BinFile()
+        binfile.add_binary(b'1234', address=10)
+        binfile.exclude(8, 10)
+        binfile.exclude(14, 15)
+        self.assertEqual(binfile.as_binary(), b"1234")
+        self.assertEqual(len(binfile.segments), 1)
+        binfile.exclude(8, 11)
+        binfile.exclude(13, 15)
+        self.assertEqual(binfile.as_binary(), b"23")
+        self.assertEqual(len(binfile.segments), 1)
+
+    def test_verilog_vmem(self):
+        binfile = bincopy.BinFile()
+
+        with open('tests/files/in-8.vmem', 'r') as fin:
+            binfile.add_verilog_vmem(fin.read())
+
+        with open('tests/files/in-8.vmem', 'r') as fin:
+            self.assertEqual(binfile.as_verilog_vmem(), fin.read())
+
+        binfile = bincopy.BinFile(word_size_bits=32)
+
+        with open('tests/files/in-32.vmem', 'r') as fin:
+            binfile.add_verilog_vmem(fin.read())
+
+        with open('tests/files/in-32.vmem', 'r') as fin:
+            self.assertEqual(binfile.as_verilog_vmem(), fin.read())
+
+        binfile = bincopy.BinFile()
+
+        with open('tests/files/empty_main-8.vmem', 'r') as fin:
+            binfile.add_verilog_vmem(fin.read())
+
+        with open('tests/files/empty_main.bin', 'rb') as fin:
+            self.assertEqual(binfile.as_binary(padding=b'\x00'), fin.read())
+
+    def test_segment_len(self):
+        length = 0x100
+        word_size_bytes = 1
+        segment = bincopy.Segment(0, length, bytes(length), word_size_bytes)
+        self.assertEqual(length, len(segment))
+
+    def test_segment_len_16(self):
+        length = 0x100
+        word_size_bytes = 2
+        segment = bincopy.Segment(0,
+                                  length,
+                                  bytes(length * word_size_bytes),
+                                  word_size_bytes)
+        self.assertEqual(length, len(segment))
+
+    def test_add_microchip_hex_record(self):
+        binfile = bincopy.BinFile()
+        binfile.add_microchip_hex(':02000E00E4C943')
+        self.assertEqual(0x0007, binfile.minimum_address)
+        first_word = int.from_bytes(binfile[:binfile.minimum_address + 1], 'little')
+        self.assertEqual(0xC9E4, first_word)
+
+    def test_microchip_hex(self):
+        binfile = bincopy.BinFile()
+
+        with open("tests/files/in.hex", "r") as fin:
+            binfile.add_microchip_hex(fin.read())
+
+        with open("tests/files/in.hex", "r") as fin:
+            self.assertEqual(binfile.as_microchip_hex(), fin.read())
+
+        # Add and overwrite the data.
+        binfile = bincopy.BinFile()
+        binfile.add_microchip_hex_file("tests/files/in.hex")
+        binfile.add_microchip_hex_file("tests/files/in.hex", overwrite=True)
+
+        with open("tests/files/in.hex") as fin:
+            self.assertEqual(binfile.as_microchip_hex(), fin.read())
+
+    def test_chunk_padding(self):
+        records = (':02000004000AF0\n'
+                   ':10B8440000000000000000009630000007770000B0\n')
+        hexfile = bincopy.BinFile()
+        hexfile.add_ihex(records)
+        align = 8
+        size = 16
+        chunks = hexfile.segments.chunks(size=size, alignment=align, padding=b'\xff')
+        chunks = list(chunks)
+        assert not any(c.address % align for c in chunks)
+        assert not any(len(c) % align for c in chunks)
+
+    def test_merge_chunks(self):
+        records = (':0A0000001010101010101010101056\n'
+                   ':0A000E001010101010101010101048\n')
+        hexfile = bincopy.BinFile()
+        hexfile.add_ihex(records)
+        align = 8
+        size = 16
+        chunks = hexfile.segments.chunks(size=size, alignment=align, padding=b'\xff')
+        chunks = list(chunks)
+        assert list(chunks[-1]) == [8, b'\x10\x10\xff\xff\xff\xff\x10\x10\x10\x10\x10'
+                                       b'\x10\x10\x10\x10\x10']
+
+    def test_merge_chunks_16(self):
+        records = (':1000000010101010101010101010101010101010F0\n'
+                   ':10000A0010101010101010101010101010101010E6\n')
+        hexfile = bincopy.BinFile(word_size_bits=16)
+        hexfile.add_ihex(records)
+        align = 6
+        size = 12
+        chunks = hexfile.segments.chunks(size=size, alignment=align,
+                                         padding=b'\xff\xff')
+        chunks = list(chunks)
+        assert list(chunks[-1]) == [6, b'\x10\x10\x10\x10\xff\xff\xff\xff\x10\x10\x10'
+                                       b'\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10'
+                                       b'\x10\x10']
 
 
 if __name__ == '__main__':

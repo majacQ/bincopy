@@ -1,10 +1,16 @@
 #!/usr/bin/env python
 
 from setuptools import setup
-import bincopy
+import re
+
+
+def find_version():
+    return re.search(r"^__version__ = '(.*)'$",
+                     open('bincopy.py', 'r').read(),
+                     re.MULTILINE).group(1)
 
 setup(name='bincopy',
-      version=bincopy.__version__,
+      version=find_version(),
       description=('Mangling of various file formats that conveys '
                    'binary information (Motorola S-Record, '
                    'Intel HEX and binary files).'),
@@ -14,10 +20,11 @@ setup(name='bincopy',
       license='MIT',
       classifiers=[
           'License :: OSI Approved :: MIT License',
-          'Programming Language :: Python :: 3.6',
-          'Programming Language :: Python :: 3.7',
-          'Programming Language :: Python :: 3.8',
           'Programming Language :: Python :: 3.9',
+          'Programming Language :: Python :: 3.10',
+          'Programming Language :: Python :: 3.11',
+          'Programming Language :: Python :: 3.12',
+          'Programming Language :: Python :: 3.13',
       ],
       keywords=['srecord',
                 'srec',
@@ -31,9 +38,10 @@ setup(name='bincopy',
       py_modules=['bincopy'],
       install_requires=[
           'humanfriendly',
-          'argparse_addons>=0.4.0'
+          'argparse_addons>=0.4.0',
+          'pyelftools'
       ],
-      python_requires='>=3.6',
+      python_requires='>=3.9',
       test_suite="tests",
       entry_points = {
           'console_scripts': ['bincopy=bincopy:_main']
